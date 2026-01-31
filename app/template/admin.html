@@ -1667,12 +1667,21 @@
         return;
       }
       
-      if (!confirm('确定要刷新所有Token的剩余次数吗？这可能需要一段时间...')) return;
-
-      // 使用当前已加载的 allTokens 数据
-      if (!allTokens || allTokens.length === 0) {
-        showToast('没有Token需要刷新，请先刷新列表', 'error');
-        return;
+      // 获取选中的 Token
+      let tokensToRefresh = [];
+      
+      if (selectedTokens.size > 0) {
+        // 如果有选中的 Token，只刷新选中的
+        tokensToRefresh = allTokens.filter(t => selectedTokens.has(t.token));
+        if (!confirm(`确定要刷新选中的 ${tokensToRefresh.length} 个Token的剩余次数吗？`)) return;
+      } else {
+        // 如果没有选中，刷新当前筛选结果中的所有 Token
+        tokensToRefresh = [...filteredTokens];
+        if (tokensToRefresh.length === 0) {
+          showToast('没有Token需要刷新', 'error');
+          return;
+        }
+        if (!confirm(`确定要刷新当前显示的 ${tokensToRefresh.length} 个Token的剩余次数吗？这可能需要一段时间...`)) return;
       }
       
       frontendRefreshActive = true;
@@ -1681,7 +1690,7 @@
       // 显示进度模态框
       showRefreshModal();
       
-      const total = allTokens.length;
+      const total = tokensToRefresh.length;
       let current = 0;
       let success = 0;
       let failed = 0;
@@ -1690,7 +1699,7 @@
       const concurrency = 10;
       
       // 创建任务队列
-      const queue = [...allTokens];
+      const queue = [...tokensToRefresh];
       const runningTasks = new Set();
       
       const processToken = async (tokenData) => {
