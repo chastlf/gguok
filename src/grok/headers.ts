@@ -50,4 +50,3 @@ export function getDynamicHeaders(settings: GrokSettings, pathname: string): Rec
   headers["Content-Type"] = pathname.includes("upload-file") ? "text/plain;charset=UTF-8" : "application/json";
   return headers;
 }
-
