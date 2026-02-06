@@ -75,4 +75,3 @@ export async function uploadImage(
   const data = (await resp.json()) as { fileMetadataId?: string; fileUri?: string };
   return { fileId: data.fileMetadataId ?? "", fileUri: data.fileUri ?? "" };
 }
-
