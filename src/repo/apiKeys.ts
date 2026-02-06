@@ -1,132 +1,192 @@
 import type { Env } from "../env";
-import { dbAll, dbFirst } from "../db";
+import { dbAll, dbFirst, dbRun } from "../db";
+import { generateApiKey } from "../utils/crypto";
 import { nowMs } from "../utils/time";
 
-export interface ApiKeyUsageRow {
+export interface ApiKeyLimits {
+  chat_limit: number; // per day, -1 = unlimited
+  heavy_limit: number; // per day, -1 = unlimited
+  image_limit: number; // per day, -1 = unlimited (count by generated images)
+  video_limit: number; // per day, -1 = unlimited
+}
+
+export interface ApiKeyRow {
   key: string;
-  day: string; // YYYY-MM-DD in configured local tz
-  chat_used: number;
-  heavy_used: number;
-  image_used: number;
-  video_used: number;
-  updated_at: number;
+  name: string;
+  created_at: number;
+  is_active: number;
+  chat_limit: number;
+  heavy_limit: number;
+  image_limit: number;
+  video_limit: number;
 }
 
-export type ApiKeyUsageField = "chat_used" | "heavy_used" | "image_used" | "video_used";
-
-function pad2(n: number): string {
-  return n < 10 ? `0${n}` : String(n);
-}
-
-export function localDayString(now = nowMs(), tzOffsetMinutes = 480): string {
-  const offsetMs = tzOffsetMinutes * 60 * 1000;
-  const local = new Date(now + offsetMs);
-  const y = local.getUTCFullYear();
-  const m = local.getUTCMonth() + 1;
-  const d = local.getUTCDate();
-  return `${y}-${pad2(m)}-${pad2(d)}`;
-}
-
-export async function listUsageForDay(db: Env["DB"], day: string): Promise<ApiKeyUsageRow[]> {
-  return dbAll<ApiKeyUsageRow>(
+export async function listApiKeys(db: Env["DB"]): Promise<ApiKeyRow[]> {
+  return dbAll<ApiKeyRow>(
     db,
-    "SELECT key, day, chat_used, heavy_used, image_used, video_used, updated_at FROM api_key_usage_daily WHERE day = ?",
-    [day],
+    "SELECT key, name, created_at, is_active, chat_limit, heavy_limit, image_limit, video_limit FROM api_keys ORDER BY created_at DESC",
   );
 }
 
-export async function getUsageForDay(
+function normalizeLimit(v: unknown): number {
+  if (v === null || v === undefined || v === "") return -1;
+  const n = Number(v);
+  if (!Number.isFinite(n)) return -1;
+  return Math.max(-1, Math.floor(n));
+}
+
+export async function addApiKey(
+  db: Env["DB"],
+  name: string,
+  opts?: { key?: string; limits?: Partial<ApiKeyLimits> },
+): Promise<ApiKeyRow> {
+  const key = String(opts?.key ?? "").trim() || generateApiKey();
+  const created_at = Math.floor(nowMs() / 1000);
+  const limits = opts?.limits ?? {};
+  const chat_limit = normalizeLimit(limits.chat_limit);
+  const heavy_limit = normalizeLimit(limits.heavy_limit);
+  const image_limit = normalizeLimit(limits.image_limit);
+  const video_limit = normalizeLimit(limits.video_limit);
+
+  await dbRun(
+    db,
+    "INSERT INTO api_keys(key,name,created_at,is_active,chat_limit,heavy_limit,image_limit,video_limit) VALUES(?,?,?,1,?,?,?,?)",
+    [key, name, created_at, chat_limit, heavy_limit, image_limit, video_limit],
+  );
+  return { key, name, created_at, is_active: 1, chat_limit, heavy_limit, image_limit, video_limit };
+}
+
+export async function batchAddApiKeys(
+  db: Env["DB"],
+  name_prefix: string,
+  count: number,
+): Promise<ApiKeyRow[]> {
+  const created_at = Math.floor(nowMs() / 1000);
+  const rows: ApiKeyRow[] = [];
+  for (let i = 1; i <= count; i++) {
+    const name = count > 1 ? `${name_prefix}-${i}` : name_prefix;
+    const key = generateApiKey();
+    rows.push({
+      key,
+      name,
+      created_at,
+      is_active: 1,
+      chat_limit: -1,
+      heavy_limit: -1,
+      image_limit: -1,
+      video_limit: -1,
+    });
+  }
+  const batch = db.batch(
+    rows.map((r) =>
+      db
+        .prepare(
+          "INSERT INTO api_keys(key,name,created_at,is_active,chat_limit,heavy_limit,image_limit,video_limit) VALUES(?,?,?,1,?,?,?,?)",
+        )
+        .bind(r.key, r.name, r.created_at, r.chat_limit, r.heavy_limit, r.image_limit, r.video_limit),
+    ),
+  );
+  await batch;
+  return rows;
+}
+
+export async function deleteApiKey(db: Env["DB"], key: string): Promise<boolean> {
+  const existing = await dbFirst<{ key: string }>(db, "SELECT key FROM api_keys WHERE key = ?", [key]);
+  if (!existing) return false;
+  await dbRun(db, "DELETE FROM api_keys WHERE key = ?", [key]);
+  return true;
+}
+
+export async function batchDeleteApiKeys(db: Env["DB"], keys: string[]): Promise<number> {
+  if (!keys.length) return 0;
+  const placeholders = keys.map(() => "?").join(",");
+  const before = await dbFirst<{ c: number }>(db, `SELECT COUNT(1) as c FROM api_keys WHERE key IN (${placeholders})`, keys);
+  await dbRun(db, `DELETE FROM api_keys WHERE key IN (${placeholders})`, keys);
+  return before?.c ?? 0;
+}
+
+export async function updateApiKeyStatus(db: Env["DB"], key: string, is_active: boolean): Promise<boolean> {
+  const existing = await dbFirst<{ key: string }>(db, "SELECT key FROM api_keys WHERE key = ?", [key]);
+  if (!existing) return false;
+  await dbRun(db, "UPDATE api_keys SET is_active = ? WHERE key = ?", [is_active ? 1 : 0, key]);
+  return true;
+}
+
+export async function batchUpdateApiKeyStatus(
+  db: Env["DB"],
+  keys: string[],
+  is_active: boolean,
+): Promise<number> {
+  if (!keys.length) return 0;
+  const placeholders = keys.map(() => "?").join(",");
+  const before = await dbFirst<{ c: number }>(db, `SELECT COUNT(1) as c FROM api_keys WHERE key IN (${placeholders})`, keys);
+  await dbRun(db, `UPDATE api_keys SET is_active = ? WHERE key IN (${placeholders})`, [is_active ? 1 : 0, ...keys]);
+  return before?.c ?? 0;
+}
+
+export async function updateApiKeyName(db: Env["DB"], key: string, name: string): Promise<boolean> {
+  const existing = await dbFirst<{ key: string }>(db, "SELECT key FROM api_keys WHERE key = ?", [key]);
+  if (!existing) return false;
+  await dbRun(db, "UPDATE api_keys SET name = ? WHERE key = ?", [name, key]);
+  return true;
+}
+
+export async function updateApiKeyLimits(
   db: Env["DB"],
   key: string,
-  day: string,
-): Promise<ApiKeyUsageRow | null> {
-  return dbFirst<ApiKeyUsageRow>(
-    db,
-    "SELECT key, day, chat_used, heavy_used, image_used, video_used, updated_at FROM api_key_usage_daily WHERE key = ? AND day = ?",
-    [key, day],
-  );
-}
+  limits: Partial<ApiKeyLimits>,
+): Promise<boolean> {
+  const existing = await dbFirst<{ key: string }>(db, "SELECT key FROM api_keys WHERE key = ?", [key]);
+  if (!existing) return false;
 
-export async function ensureUsageRow(db: Env["DB"], key: string, day: string, atMs: number): Promise<void> {
-  await db
-    .prepare("INSERT OR IGNORE INTO api_key_usage_daily(key, day, updated_at) VALUES(?,?,?)")
-    .bind(key, day, atMs)
-    .run();
-}
-
-export async function tryConsumeDailyUsage(args: {
-  db: Env["DB"];
-  key: string;
-  day: string;
-  field: ApiKeyUsageField;
-  inc: number;
-  limit: number; // -1 = unlimited
-  atMs: number;
-}): Promise<boolean> {
-  const inc = Math.max(0, Math.floor(Number(args.inc) || 0));
-  if (!inc) return true;
-
-  await ensureUsageRow(args.db, args.key, args.day, args.atMs);
-
-  const sql = `UPDATE api_key_usage_daily
-    SET ${args.field} = ${args.field} + ?, updated_at = ?
-    WHERE key = ? AND day = ? AND (? < 0 OR ${args.field} + ? <= ?)`;
-
-  const res = await args.db
-    .prepare(sql)
-    .bind(inc, args.atMs, args.key, args.day, args.limit, inc, args.limit)
-    .run();
-
-  const changes = Number((res as any)?.meta?.changes ?? 0);
-  return changes > 0;
-}
-
-export async function tryConsumeDailyUsageMulti(args: {
-  db: Env["DB"];
-  key: string;
-  day: string;
-  updates: Array<{ field: ApiKeyUsageField; inc: number; limit: number }>;
-  atMs: number;
-}): Promise<boolean> {
-  const normalized = args.updates
-    .map((u) => ({
-      field: u.field,
-      inc: Math.max(0, Math.floor(Number(u.inc) || 0)),
-      limit: Math.floor(Number(u.limit) || -1),
-    }))
-    .filter((u) => u.inc > 0);
-
-  if (!normalized.length) return true;
-  await ensureUsageRow(args.db, args.key, args.day, args.atMs);
-
-  const setParts: string[] = [];
-  const whereParts: string[] = [];
+  const parts: string[] = [];
   const params: unknown[] = [];
-
-  // SET field = field + inc
-  for (const u of normalized) {
-    setParts.push(`${u.field} = ${u.field} + ?`);
-    params.push(u.inc);
+  if (limits.chat_limit !== undefined) {
+    parts.push("chat_limit = ?");
+    params.push(normalizeLimit(limits.chat_limit));
   }
-
-  // updated_at last
-  setParts.push("updated_at = ?");
-  params.push(args.atMs);
-
-  // WHERE base
-  params.push(args.key, args.day);
-
-  // WHERE quota conditions: (limit < 0 OR field + inc <= limit)
-  for (const u of normalized) {
-    whereParts.push("(? < 0 OR " + u.field + " + ? <= ?)");
-    params.push(u.limit, u.inc, u.limit);
+  if (limits.heavy_limit !== undefined) {
+    parts.push("heavy_limit = ?");
+    params.push(normalizeLimit(limits.heavy_limit));
   }
+  if (limits.image_limit !== undefined) {
+    parts.push("image_limit = ?");
+    params.push(normalizeLimit(limits.image_limit));
+  }
+  if (limits.video_limit !== undefined) {
+    parts.push("video_limit = ?");
+    params.push(normalizeLimit(limits.video_limit));
+  }
+  if (!parts.length) return true;
+  params.push(key);
 
-  const sql = `UPDATE api_key_usage_daily
-    SET ${setParts.join(", ")}
-    WHERE key = ? AND day = ? AND ${whereParts.join(" AND ")}`;
+  await dbRun(db, `UPDATE api_keys SET ${parts.join(", ")} WHERE key = ?`, params);
+  return true;
+}
 
-  const res = await args.db.prepare(sql).bind(...params).run();
-  const changes = Number((res as any)?.meta?.changes ?? 0);
-  return changes > 0;
+export async function validateApiKey(db: Env["DB"], key: string): Promise<{ key: string; name: string } | null> {
+  const row = await dbFirst<{ key: string; name: string; is_active: number }>(
+    db,
+    "SELECT key, name, is_active FROM api_keys WHERE key = ?",
+    [key],
+  );
+  if (!row) return null;
+  if (!row.is_active) return null;
+  return { key: row.key, name: row.name };
+}
+
+export async function getApiKeyLimits(db: Env["DB"], key: string): Promise<ApiKeyLimits | null> {
+  const row = await dbFirst<ApiKeyLimits & { is_active: number }>(
+    db,
+    "SELECT is_active, chat_limit, heavy_limit, image_limit, video_limit FROM api_keys WHERE key = ?",
+    [key],
+  );
+  if (!row) return null;
+  if (!row.is_active) return null;
+  return {
+    chat_limit: Number(row.chat_limit ?? -1),
+    heavy_limit: Number(row.heavy_limit ?? -1),
+    image_limit: Number(row.image_limit ?? -1),
+    video_limit: Number(row.video_limit ?? -1),
+  };
 }
