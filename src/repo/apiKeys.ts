@@ -1,98 +1,132 @@
 import type { Env } from "../env";
-import { dbAll, dbFirst, dbRun } from "../db";
-import { generateApiKey } from "../utils/crypto";
+import { dbAll, dbFirst } from "../db";
 import { nowMs } from "../utils/time";
 
-export interface ApiKeyRow {
+export interface ApiKeyUsageRow {
   key: string;
-  name: string;
-  created_at: number;
-  is_active: number;
+  day: string; // YYYY-MM-DD in configured local tz
+  chat_used: number;
+  heavy_used: number;
+  image_used: number;
+  video_used: number;
+  updated_at: number;
 }
 
-export async function listApiKeys(db: Env["DB"]): Promise<ApiKeyRow[]> {
-  return dbAll<ApiKeyRow>(db, "SELECT key, name, created_at, is_active FROM api_keys ORDER BY created_at DESC");
+export type ApiKeyUsageField = "chat_used" | "heavy_used" | "image_used" | "video_used";
+
+function pad2(n: number): string {
+  return n < 10 ? `0${n}` : String(n);
 }
 
-export async function addApiKey(db: Env["DB"], name: string): Promise<ApiKeyRow> {
-  const key = generateApiKey();
-  const created_at = Math.floor(nowMs() / 1000);
-  await dbRun(
+export function localDayString(now = nowMs(), tzOffsetMinutes = 480): string {
+  const offsetMs = tzOffsetMinutes * 60 * 1000;
+  const local = new Date(now + offsetMs);
+  const y = local.getUTCFullYear();
+  const m = local.getUTCMonth() + 1;
+  const d = local.getUTCDate();
+  return `${y}-${pad2(m)}-${pad2(d)}`;
+}
+
+export async function listUsageForDay(db: Env["DB"], day: string): Promise<ApiKeyUsageRow[]> {
+  return dbAll<ApiKeyUsageRow>(
     db,
-    "INSERT INTO api_keys(key,name,created_at,is_active) VALUES(?,?,?,1)",
-    [key, name, created_at],
+    "SELECT key, day, chat_used, heavy_used, image_used, video_used, updated_at FROM api_key_usage_daily WHERE day = ?",
+    [day],
   );
-  return { key, name, created_at, is_active: 1 };
 }
 
-export async function batchAddApiKeys(
+export async function getUsageForDay(
   db: Env["DB"],
-  name_prefix: string,
-  count: number,
-): Promise<ApiKeyRow[]> {
-  const created_at = Math.floor(nowMs() / 1000);
-  const rows: ApiKeyRow[] = [];
-  for (let i = 1; i <= count; i++) {
-    const name = count > 1 ? `${name_prefix}-${i}` : name_prefix;
-    const key = generateApiKey();
-    rows.push({ key, name, created_at, is_active: 1 });
+  key: string,
+  day: string,
+): Promise<ApiKeyUsageRow | null> {
+  return dbFirst<ApiKeyUsageRow>(
+    db,
+    "SELECT key, day, chat_used, heavy_used, image_used, video_used, updated_at FROM api_key_usage_daily WHERE key = ? AND day = ?",
+    [key, day],
+  );
+}
+
+export async function ensureUsageRow(db: Env["DB"], key: string, day: string, atMs: number): Promise<void> {
+  await db
+    .prepare("INSERT OR IGNORE INTO api_key_usage_daily(key, day, updated_at) VALUES(?,?,?)")
+    .bind(key, day, atMs)
+    .run();
+}
+
+export async function tryConsumeDailyUsage(args: {
+  db: Env["DB"];
+  key: string;
+  day: string;
+  field: ApiKeyUsageField;
+  inc: number;
+  limit: number; // -1 = unlimited
+  atMs: number;
+}): Promise<boolean> {
+  const inc = Math.max(0, Math.floor(Number(args.inc) || 0));
+  if (!inc) return true;
+
+  await ensureUsageRow(args.db, args.key, args.day, args.atMs);
+
+  const sql = `UPDATE api_key_usage_daily
+    SET ${args.field} = ${args.field} + ?, updated_at = ?
+    WHERE key = ? AND day = ? AND (? < 0 OR ${args.field} + ? <= ?)`;
+
+  const res = await args.db
+    .prepare(sql)
+    .bind(inc, args.atMs, args.key, args.day, args.limit, inc, args.limit)
+    .run();
+
+  const changes = Number((res as any)?.meta?.changes ?? 0);
+  return changes > 0;
+}
+
+export async function tryConsumeDailyUsageMulti(args: {
+  db: Env["DB"];
+  key: string;
+  day: string;
+  updates: Array<{ field: ApiKeyUsageField; inc: number; limit: number }>;
+  atMs: number;
+}): Promise<boolean> {
+  const normalized = args.updates
+    .map((u) => ({
+      field: u.field,
+      inc: Math.max(0, Math.floor(Number(u.inc) || 0)),
+      limit: Math.floor(Number(u.limit) || -1),
+    }))
+    .filter((u) => u.inc > 0);
+
+  if (!normalized.length) return true;
+  await ensureUsageRow(args.db, args.key, args.day, args.atMs);
+
+  const setParts: string[] = [];
+  const whereParts: string[] = [];
+  const params: unknown[] = [];
+
+  // SET field = field + inc
+  for (const u of normalized) {
+    setParts.push(`${u.field} = ${u.field} + ?`);
+    params.push(u.inc);
   }
-  const batch = db.batch(
-    rows.map((r) => db.prepare("INSERT INTO api_keys(key,name,created_at,is_active) VALUES(?,?,?,1)").bind(r.key, r.name, r.created_at)),
-  );
-  await batch;
-  return rows;
-}
 
-export async function deleteApiKey(db: Env["DB"], key: string): Promise<boolean> {
-  const existing = await dbFirst<{ key: string }>(db, "SELECT key FROM api_keys WHERE key = ?", [key]);
-  if (!existing) return false;
-  await dbRun(db, "DELETE FROM api_keys WHERE key = ?", [key]);
-  return true;
-}
+  // updated_at last
+  setParts.push("updated_at = ?");
+  params.push(args.atMs);
 
-export async function batchDeleteApiKeys(db: Env["DB"], keys: string[]): Promise<number> {
-  if (!keys.length) return 0;
-  const placeholders = keys.map(() => "?").join(",");
-  const before = await dbFirst<{ c: number }>(db, `SELECT COUNT(1) as c FROM api_keys WHERE key IN (${placeholders})`, keys);
-  await dbRun(db, `DELETE FROM api_keys WHERE key IN (${placeholders})`, keys);
-  return before?.c ?? 0;
-}
+  // WHERE base
+  params.push(args.key, args.day);
 
-export async function updateApiKeyStatus(db: Env["DB"], key: string, is_active: boolean): Promise<boolean> {
-  const existing = await dbFirst<{ key: string }>(db, "SELECT key FROM api_keys WHERE key = ?", [key]);
-  if (!existing) return false;
-  await dbRun(db, "UPDATE api_keys SET is_active = ? WHERE key = ?", [is_active ? 1 : 0, key]);
-  return true;
-}
+  // WHERE quota conditions: (limit < 0 OR field + inc <= limit)
+  for (const u of normalized) {
+    whereParts.push("(? < 0 OR " + u.field + " + ? <= ?)");
+    params.push(u.limit, u.inc, u.limit);
+  }
 
-export async function batchUpdateApiKeyStatus(
-  db: Env["DB"],
-  keys: string[],
-  is_active: boolean,
-): Promise<number> {
-  if (!keys.length) return 0;
-  const placeholders = keys.map(() => "?").join(",");
-  const before = await dbFirst<{ c: number }>(db, `SELECT COUNT(1) as c FROM api_keys WHERE key IN (${placeholders})`, keys);
-  await dbRun(db, `UPDATE api_keys SET is_active = ? WHERE key IN (${placeholders})`, [is_active ? 1 : 0, ...keys]);
-  return before?.c ?? 0;
-}
+  const sql = `UPDATE api_key_usage_daily
+    SET ${setParts.join(", ")}
+    WHERE key = ? AND day = ? AND ${whereParts.join(" AND ")}`;
 
-export async function updateApiKeyName(db: Env["DB"], key: string, name: string): Promise<boolean> {
-  const existing = await dbFirst<{ key: string }>(db, "SELECT key FROM api_keys WHERE key = ?", [key]);
-  if (!existing) return false;
-  await dbRun(db, "UPDATE api_keys SET name = ? WHERE key = ?", [name, key]);
-  return true;
+  const res = await args.db.prepare(sql).bind(...params).run();
+  const changes = Number((res as any)?.meta?.changes ?? 0);
+  return changes > 0;
 }
-
-export async function validateApiKey(db: Env["DB"], key: string): Promise<{ key: string; name: string } | null> {
-  const row = await dbFirst<{ key: string; name: string; is_active: number }>(
-    db,
-    "SELECT key, name, is_active FROM api_keys WHERE key = ?",
-    [key],
-  );
-  if (!row) return null;
-  if (!row.is_active) return null;
-  return { key: row.key, name: row.name };
-}
-
