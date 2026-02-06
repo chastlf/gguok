@@ -18,4 +18,3 @@ export async function checkRateLimits(
   if (!resp.ok) return null;
   return (await resp.json()) as Record<string, unknown>;
 }
-
